@@ -1998,14 +1998,23 @@ function render(ui) {
 
   // Recent jobs — rendered into the Jobs page
   const jobsWrap = $('jobsPageWrap');
+  
   if (jobsWrap) {
-    const jobsFp = _jobsFingerprint(printers);
-    if (_renderedJobsCard?.fingerprint !== jobsFp) {
-      const newCard = renderRecentJobsCard(printers);
-      jobsWrap.innerHTML = '';
-      jobsWrap.appendChild(newCard);
-      _renderedJobsCard = { el: newCard, fingerprint: jobsFp };
-    }
+      // Include actual page to force rendering when
+      // pressing Prev / Next.
+      const jobsFp = `${_jobsFingerprint(printers)}|page:${jobHistoryPage}`;
+  
+      if (_renderedJobsCard?.fingerprint !== jobsFp) {
+          const newCard = renderRecentJobsCard(printers);
+  
+          jobsWrap.innerHTML = '';
+          jobsWrap.appendChild(newCard);
+  
+          _renderedJobsCard = {
+              el: newCard,
+              fingerprint: jobsFp
+          };
+      }
   }
 }
 
