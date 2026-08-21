@@ -829,6 +829,12 @@ _SSH_FILE_PATHS = [
     "/usr/data/creality/userdata/box/material_box_info.json",
 ]
 
+# K2 Pro stores the Spoolman ID encoded in tn_data.json -> base_data -> Tn -> vender.
+_TN_DATA_PATHS = [
+    "/mnt/UDISK/creality/userdata/box/tn_data.json",
+    "/usr/data/creality/userdata/box/tn_data.json",
+]
+
 
 async def _fetch_printer_material_json(printer_id: str) -> Optional[dict]:
     """Fetch material_box_info.json from the printer via sshpass + system ssh."""
@@ -878,6 +884,171 @@ async def _fetch_printer_material_json(printer_id: str) -> Optional[dict]:
             return None
 
     return await asyncio.get_event_loop().run_in_executor(None, _ssh_cat)
+
+
+
+def _tn_vendor_spoolman_id(raw: str) -> Optional[int]:
+    """
+    Extract the Spoolman spool ID encoded by the K2 Pro in tn_data.json.
+
+    The field is a six-character decimal value at positions 28:34:
+        ...000010... -> Spoolman #10
+        ...000011... -> Spoolman #11
+        ...000009... -> Spoolman #9
+        ...000002... -> Spoolman #2
+    """
+    raw = str(raw or "").strip()
+    if not raw or raw == "-1" or len(raw) < 34:
+        return None
+
+    value = raw[28:34]
+    if len(value) != 6 or not value.isdigit():
+        return None
+
+    try:
+        spool_id = int(value, 10)
+    except ValueError:
+        return None
+
+    return spool_id if spool_id > 0 else None
+
+
+async def _fetch_printer_tn_data(printer_id: str) -> Optional[dict]:
+    """Fetch K2 Pro tn_data.json from the printer via sshpass/system ssh."""
+    host = (_printer_address(printer_id) or "").strip().split(":")[0]
+    if not host:
+        return None
+
+    def _ssh_cat() -> Optional[dict]:
+        import subprocess
+
+        working = _ssh_working_password.get(printer_id)
+        candidates = (
+            [working] + [p for p in _SSH_PASSWORDS if p != working]
+            if working else _SSH_PASSWORDS
+        )
+
+        try:
+            for password in candidates:
+                cmd = " || ".join(f"cat {p}" for p in _TN_DATA_PATHS)
+                result = subprocess.run(
+                    [
+                        "sshpass", "-p", password,
+                        "ssh",
+                        "-o", "StrictHostKeyChecking=no",
+                        "-o", "UserKnownHostsFile=/dev/null",
+                        "-o", "ConnectTimeout=5",
+                        f"root@{host}",
+                        cmd,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+
+                if result.returncode == 0 and result.stdout.strip():
+                    if _ssh_working_password.get(printer_id) != password:
+                        print(f"[TN] ({printer_id}) authenticated with password {password!r}")
+                        _ssh_working_password[printer_id] = password
+                    return json.loads(result.stdout)
+
+                if result.returncode != 5:
+                    print(
+                        f"[TN] fetch failed ({host}): "
+                        f"{result.stderr.strip() or 'no output'}"
+                    )
+                    return None
+
+            print(f"[TN] all passwords failed for {host}")
+            return None
+
+        except FileNotFoundError:
+            print("[TN] sshpass not found; run: apt install sshpass")
+            return None
+        except Exception as e:
+            print(f"[TN] fetch failed ({host}): {e}")
+            return None
+
+    return await asyncio.get_event_loop().run_in_executor(None, _ssh_cat)
+
+
+def _apply_tn_data_links(info: dict, printer_id: str) -> None:
+    """
+    Auto-link CFS slots to Spoolman using K2 Pro tn_data.json.
+
+    Mapping:
+        T1 vender[0..3] -> 1A..1D
+        T2 vender[0..3] -> 2A..2D
+        T3 vender[0..3] -> 3A..3D
+        T4 vender[0..3] -> 4A..4D
+    """
+    if not isinstance(info, dict):
+        return
+
+    base_data = info.get("base_data")
+    if not isinstance(base_data, dict):
+        return
+
+    base = _spoolman_base_url()
+    st = load_state(printer_id)
+    changed = False
+
+    for box_num in range(1, 5):
+        box = base_data.get(f"T{box_num}")
+        if not isinstance(box, dict):
+            continue
+
+        vendors = box.get("vender")
+        if not isinstance(vendors, list):
+            continue
+
+        for index, raw in enumerate(vendors[:4]):
+            spool_id = _tn_vendor_spoolman_id(raw)
+            if not spool_id:
+                continue
+
+            slot = f"{box_num}{'ABCD'[index]}"
+            if slot not in _VALID_CFS_SLOT_IDS:
+                continue
+
+            # Only link IDs that really exist in Spoolman. If Spoolman is
+            # temporarily unavailable, keep the current mapping untouched.
+            if base:
+                try:
+                    spool = _spoolman_get_spool(base, spool_id)
+                    if not isinstance(spool, dict) or not spool.get("id"):
+                        print(
+                            f"[TN] ({printer_id}) Slot {slot}: "
+                            f"spool #{spool_id} not found in Spoolman"
+                        )
+                        continue
+                except Exception as e:
+                    print(
+                        f"[TN] ({printer_id}) Slot {slot}: "
+                        f"Spoolman lookup failed for spool #{spool_id}: {e}"
+                    )
+                    continue
+
+            slot_obj = st.slots.get(slot)
+            if slot_obj is None:
+                slot_obj = SlotState(slot=slot)
+
+            old_id = getattr(slot_obj, "spoolman_id", None)
+            if old_id == spool_id:
+                continue
+
+            slot_obj.spoolman_id = spool_id
+            st.slots[slot] = slot_obj
+            changed = True
+
+            print(
+                f"[TN] ({printer_id}) Slot {slot}: "
+                f"linked Spoolman {old_id!r} -> #{spool_id} "
+                f"from tn_data.json"
+            )
+
+    if changed:
+        save_state(printer_id, st)
 
 
 def _apply_serialnum_links(info: dict, printer_id: str) -> None:
@@ -938,11 +1109,26 @@ def _apply_serialnum_links(info: dict, printer_id: str) -> None:
 
 
 async def _ssh_fetch_and_apply(printer_id: str) -> None:
-    """Fetch material_box_info.json via SSH and apply serialNum-based auto-links."""
-    _ssh_last_fetch[printer_id] = time.time()
-    info = await _fetch_printer_material_json(printer_id)
-    if info:
-        _apply_serialnum_links(info, printer_id)
+    """
+    Refresh CFS -> Spoolman links from printer-side data.
+
+    K2 Pro prefers tn_data.json because its 'vender' field contains the
+    Spoolman ID encoded in the RFID data. material_box_info.json/serialNum
+    remains as a compatibility fallback for other firmware/models.
+    """
+    try:
+        tn_info = await _fetch_printer_tn_data(printer_id)
+        if tn_info:
+            _apply_tn_data_links(tn_info, printer_id)
+    except Exception as e:
+        print(f"[TN] ({printer_id}) auto-link failed: {e}")
+
+    try:
+        info = await _fetch_printer_material_json(printer_id)
+        if info:
+            _apply_serialnum_links(info, printer_id)
+    except Exception as e:
+        print(f"[SSH] ({printer_id}) serialNum auto-link failed: {e}")
 
 
 def _color_distance(hex1: str, hex2: str) -> float:
@@ -1314,24 +1500,23 @@ def _parse_ws_cfs_data(payload: dict, printer_id: str) -> None:
         else:
             last_fingerprint.pop(slot, None)
 
-        # SSH serialNum-based auto-link is only available for CFS slots.
-        if allow_ssh_serial_lookup and state_val == 2 and prev_state != 2:
+        # K2 Pro / serialNum auto-link is only available for CFS slots.
+        # Refresh on first detection/insertion and periodically afterwards.
+        # Reserve the cooldown before creating the task so A/B/C/D do not
+        # start several simultaneous SSH sessions from the same WS payload.
+        if allow_ssh_serial_lookup and state_val == 2:
             now = time.time()
-            if now - _ssh_last_fetch.get(printer_id, 0.0) > _SSH_FETCH_COOLDOWN:
+            last_fetch = _ssh_last_fetch.get(printer_id, 0.0)
+            if prev_state != 2 or now - last_fetch > _SSH_FETCH_COOLDOWN:
+                _ssh_last_fetch[printer_id] = now
                 asyncio.create_task(_ssh_fetch_and_apply(printer_id))
 
-        # Track RFID changes to detect implicit spool swaps (unlink on RFID change)
+        # boxsInfo["rfid"] is not a unique physical spool UID on K2 Pro.
+        # Different spools may expose the same value, so keep it only as
+        # diagnostic/cache data and NEVER unlink Spoolman based on it.
         rfid = mat.get("rfid", "")
-        if rfid and state_val == 2:  # state 2 = RFID-tagged spool
-            prev_rfid = last_rfid.get(slot, "")
-            if rfid != prev_rfid:
-                last_rfid[slot] = rfid
-                slot_obj2 = st.slots.get(slot)
-                if slot_obj2 and getattr(slot_obj2, "spoolman_id", None):
-                    # RFID changed on a linked slot — implicit spool swap, unlink
-                    slot_obj2.spoolman_id = None
-                    st.slots[slot] = slot_obj2
-                    st.ws_slot_length_m.pop(slot, None)  # reset baseline
+        if rfid and state_val == 2:
+            last_rfid[slot] = str(rfid)
 
         # Track cumulative length for per-job Moonraker attribution
         cur_m = float(mat.get("usedMaterialLength") or 0)
