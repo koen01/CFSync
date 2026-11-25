@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -490,7 +491,18 @@ def _migrate_multi_state_dict(data: dict) -> dict:
 _state_load_failed: bool = False  # True when last load fell back to default
 
 
+# state.json is read/written from the event loop and the request threadpool.
+# Unsynchronised saves shared one .tmp file, so a reader could see an empty file, fall back
+# to default state, and a later save wrote that back, wiping slot links. Serialise all access.
+_STATE_LOCK = threading.RLock()
+
+
 def load_state_all() -> MultiAppState:
+    with _STATE_LOCK:
+        return _load_state_all_locked()
+
+
+def _load_state_all_locked() -> MultiAppState:
     global _state_load_failed
     _ensure_data_files()
     try:
@@ -521,11 +533,12 @@ def save_state_all(state: MultiAppState) -> None:
     if _state_load_failed:
         print("[STATE] save skipped: last load returned fallback default")
         return
-    state.updated_at = _now()
-    data = json.dumps(_model_dump(state), indent=2, ensure_ascii=False)
-    tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(data)
-    tmp.rename(STATE_PATH)  # atomic on Linux (same filesystem)
+    with _STATE_LOCK:  # serialised; per-writer tmp name
+        state.updated_at = _now()
+        data = json.dumps(_model_dump(state), indent=2, ensure_ascii=False)
+        tmp = STATE_PATH.with_name(f"{STATE_PATH.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(data)
+        tmp.rename(STATE_PATH)  # atomic on Linux (same filesystem)
 
 
 def _all_printer_ids() -> List[str]:
@@ -588,9 +601,10 @@ def load_state(printer_id: Optional[str] = None) -> AppState:
 
 def save_state(printer_id: str, state: AppState) -> None:
     pid = _resolve_printer_id(printer_id, allow_unknown=True)
-    st = load_state_all()
-    st.printers[pid] = state
-    save_state_all(st)
+    with _STATE_LOCK:  # load+save as one step
+        st = load_state_all()
+        st.printers[pid] = state
+        save_state_all(st)
 
 
 # --- Printer adapter (Dummy) ---
